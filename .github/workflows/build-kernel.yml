@@ -1,0 +1,105 @@
+name: Build R17 Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '编译模式（先跑 stock 验证开机）'
+        required: true
+        default: 'stock'
+        type: choice
+        options:
+          - stock
+          - ksunext
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+
+    steps:
+      - name: 检出内核源码
+        uses: actions/checkout@v4
+        with:
+          ref: ten
+          fetch-depth: 1
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            bc bison flex libssl-dev libelf-dev ccache \
+            python3 make gcc device-tree-compiler zip curl
+
+      - name: 下载 GCC 4.9 工具链
+        run: |
+          git clone --depth 1 \
+            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 \
+            $GITHUB_WORKSPACE/tc
+
+      - name: 应用 defconfig
+        run: |
+          cp arch/arm64/configs/sdm670_r17_ksu_defconfig .config
+          grep -E "CONFIG_KSU=|# CONFIG_OPPO_ROOT_CHECK" .config
+
+      - name: 解析依赖
+        run: |
+          export ARCH=arm64 SUBARCH=arm64
+          export CROSS_COMPILE=$GITHUB_WORKSPACE/tc/bin/aarch64-linux-android-
+          make olddefconfig
+
+      # ================= 仅 ksunext 模式 =================
+      - name: [KSU] 拉取 Reno 4.9 backport
+        if: inputs.mode == 'ksunext'
+        run: |
+          git config user.email ci@example.com
+          git config user.name CI
+          git remote add reno https://github.com/OP46B1-Dev/android_kernel_oppo_sdm710.git
+          git fetch --depth 1 reno deprecated/color-11.1_rksu
+          for sha in \
+            ba18867fe84e9e41d13535eee933a9f5e733babf \
+            7e103d9bc84bbb791b65b15ad7c9b62d3023eb0e \
+            782269366a1928466ba8aa4f0bffc88da861d866 \
+            be3865c776a668bc914976b6c5f42fc8b1fe8bd1 \
+            3460c15b1b937b7a8b256c1f2982debc10bf1301 \
+            38baa0988a7aeef2efbfb4ccf6b06dd8d50e0538 \
+            ba688d384ae45185e509d4152c5c86b82b1011bb ; do
+            echo "--- cherry-pick $sha"
+            git cherry-pick --no-commit "$sha" 2>&1 | tail -3 || echo "[!] 冲突 $sha"
+          done
+          git status --short | head -30
+
+      - name: [KSU] 安装 KernelSU-Next
+        if: inputs.mode == 'ksunext'
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/legacy/kernel/setup.sh" | bash -s legacy
+          ls drivers/kernelsu 2>/dev/null | head || echo "[!] 缺失"
+
+      - name: [KSU] 注入 hook
+        if: inputs.mode == 'ksunext'
+        run: python3 ksu-build/inject_hooks.py .
+
+      # ================= 编译 =================
+      - name: 编译
+        run: |
+          export ARCH=arm64 SUBARCH=arm64
+          export CROSS_COMPILE=$GITHUB_WORKSPACE/tc/bin/aarch64-linux-android-
+          export USE_CCACHE=1 CCACHE_DIR=$GITHUB_WORKSPACE/.ccache
+          make -j$(nproc) 2>&1 | tail -80
+
+      - name: 收集产物
+        run: |
+          mkdir -p out
+          for f in arch/arm64/boot/Image.gz-dtb arch/arm64/boot/Image.gz arch/arm64/boot/Image; do
+            [ -f "$f" ] && cp "$f" out/
+          done
+          cp .config out/config.txt
+          ls -la out/
+
+      - name: 上传
+        uses: actions/upload-artifact@v4
+        with:
+          name: r17-${{ inputs.mode }}
+          path: out/
+          retention-days: 30
+
