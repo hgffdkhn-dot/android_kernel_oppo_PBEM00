@@ -31,88 +31,100 @@ jobs:
             bc bison flex libssl-dev libelf-dev ccache \
             make gcc device-tree-compiler zip curl \
             python3 python-is-python3
-          # 工具链里的 gcc 是 #!/usr/bin/python 包装脚本，
-          # Ubuntu 22.04 默认没有 /usr/bin/python，必须装 python-is-python3
 
       - name: 下载 GCC 4.9 工具链
         run: |
           set -e
           rm -rf "$GITHUB_WORKSPACE/tc"
           mkdir -p "$GITHUB_WORKSPACE/tc"
-          echo "尝试主源: LineageOS 镜像"
           if git clone --depth 1 -b lineage-19.1 \
               https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git \
               "$GITHUB_WORKSPACE/tc" ; then
-            echo "[OK] 主源下载成功"
+            echo "[OK] LineageOS 镜像"
           else
-            echo "[!] 主源失败，回退 AOSP"
             rm -rf "$GITHUB_WORKSPACE/tc"
-            mkdir -p "$GITHUB_WORKSPACE/tc"
             git clone --depth 1 \
               https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 \
               "$GITHUB_WORKSPACE/tc"
           fi
 
-      - name: 校验工具链（缺失立刻失败，不再假绿）
+      - name: 校验工具链
         run: |
           set -e
           export CROSS_COMPILE=$GITHUB_WORKSPACE/tc/bin/aarch64-linux-android-
-          ls -la "$GITHUB_WORKSPACE/tc/bin/" | head -20
-          if [ ! -f "${CROSS_COMPILE}gcc" ]; then
-            echo "::error::工具链缺失: ${CROSS_COMPILE}gcc"
-            exit 1
-          fi
+          [ -f "${CROSS_COMPILE}gcc" ] || { echo "::error::工具链缺失"; exit 1; }
           chmod +x "$GITHUB_WORKSPACE/tc/bin/"*
-          "${CROSS_COMPILE}gcc" --version || {
-            echo "::error::gcc 无法执行（可能缺少 /usr/bin/python）"
-            exit 1
-          }
+          "${CROSS_COMPILE}gcc" --version || { echo "::error::gcc 无法执行"; exit 1; }
 
-      - name: 修复蓝牙 btfm_slim 编译
+      # ============================================================
+      # ten 分支（realme X fork）里从未被编译过的代码路径，
+      # 被 R17 出厂配置触发后才暴露。以下按实际报错逐个修。
+      # ============================================================
+
+      - name: "[修复1] 蓝牙 btfm_slim — 缺 include 路径"
         run: |
           set -e
-          echo "=== 根因：btfm_slim.c 用 #include <btfm_slim.h>（尖括号），"
-          echo "    但 drivers/bluetooth/Makefile 没有 -I 指向自身目录，gcc 找不到。"
-          echo "    头文件其实一直在仓库里，缺的是 include 搜索路径。"
-
-          # 1) 确保头文件在位（从本仓库 ksu-build/ 兜底，不依赖外网）
+          # btfm_slim.c 用 #include <btfm_slim.h>，但 Makefile 无 -I 指向自身目录
           for h in btfm_slim.h btfm_slim_wcn3990.h; do
             if [ -f "drivers/bluetooth/$h" ]; then
               echo "[=] $h 已存在"
             else
-              cp "ksu-build/$h" "drivers/bluetooth/$h" && echo "[+] 已补齐 $h"
+              cp "ksu-build/$h" "drivers/bluetooth/$h" && echo "[+] 补齐 $h"
             fi
           done
-
-          # 2) 给 Makefile 加 include 搜索路径（真正的关键修复）
           MK=drivers/bluetooth/Makefile
-          if grep -q "^-I\$(src)" "$MK"; then
-            echo "[=] $MK 已有 -I\$(src)"
-          else
-            cp "$MK" "$MK.bak"
+          if [ -f "$MK" ] && ! grep -q -- '-I\$(src)' "$MK"; then
             sed -i '/^ccflags-y/a ccflags-y += -I$(src)' "$MK"
-            echo "[+] 已插入 ccflags-y += -I\$(src)"
+            echo "[+] 已给 $MK 加 -I\$(src)"
           fi
-          echo "--- 当前 ccflags 行:"
-          grep -n "ccflags" "$MK"
+          grep -n "ccflags" "$MK" || true
 
-      - name: 移除 R17 不存在的 NXP 功放 (tfa98xx)
+      - name: "[修复2] NXP 功放 tfa98xx — R17 无此硬件"
         run: |
           set -e
-          # R17 出厂配置无 NXP 功放，但 techpack Makefile 硬编码编它，
-          # 且它带 GCC4.9 不认识的 -Wno-enum-conversion，被 -Werror 放大成错。
-          echo "--- 处理前的引用:"
-          grep -rn "tfa98xx" techpack/audio --include=Makefile* || true
-          find techpack -name 'Makefile*' -exec sed -i '/[tT][fF][aA]98/d' {} + || true
-          echo "--- 处理后:"
-          grep -rn "tfa98xx" techpack/audio --include=Makefile* || echo "(已清空)"
+          # 报错: 'np' undeclared / tfa98xx_parse_dt / -Wno-enum-conversion
+          # R17 出厂配置确认无 NXP 功放（TFA9879 都是 n）
+          echo "=== 处理前 Makefile 引用 ==="
+          grep -rni "tfa98" techpack/ --include=Makefile --include=Kbuild || echo "(无)"
+          find techpack \( -name 'Makefile' -o -name 'Kbuild' \) \
+            -exec sed -i '/tfa98/Id' {} + 2>/dev/null || true
+          # 兜底：即便父 Makefile 仍递归进来，子目录 Makefile 为空则不编译
+          for m in $(find techpack -path '*tfa98xx*' -name 'Makefile'); do
+            : > "$m"; echo "[+] 已清空 $m"
+          done
+          echo "=== 处理后 Makefile 引用 ==="
+          grep -rni "tfa98" techpack/ --include=Makefile --include=Kbuild || echo "(已清空)"
 
-      - name: 移除 GCC 4.9 不支持的编译选项
+      - name: "[修复3] mdss_pll_trace.h — trace 头文件路径"
         run: |
           set -e
-          before=$(grep -rl "Wno-enum-conversion" techpack kernel drivers 2>/dev/null | wc -l)
-          echo "命中文件数: $before"
-          grep -rl "Wno-enum-conversion" techpack kernel drivers 2>/dev/null \
+          # 报错: ./include/trace/define_trace.h:88 fatal error: ./mdss_pll_trace.h
+          # 成因: mdss_pll_trace.h 里 #define TRACE_INCLUDE_PATH .
+          #      define_trace.h 在 include/trace/ 下，按相对自身目录找不到该文件
+          H=drivers/clk/qcom/mdss/mdss_pll_trace.h
+          if [ -f "$H" ]; then
+            cp "$H" "$H.bak"
+            sed -i 's|#define TRACE_INCLUDE_PATH \.$|#define TRACE_INCLUDE_PATH ../../drivers/clk/qcom/mdss|' "$H"
+            echo "[+] 已改 TRACE_INCLUDE_PATH:"
+            grep -n "TRACE_INCLUDE_PATH" "$H" | tail -2
+          else
+            echo "[!] $H 不存在，跳过"
+          fi
+          MK=drivers/clk/qcom/mdss/Makefile
+          if [ -f "$MK" ] && ! grep -q -- '-I\$(src)' "$MK"; then
+            sed -i '/^ccflags-y/a ccflags-y += -I$(src)' "$MK" 2>/dev/null \
+              || echo "ccflags-y += -I$(src)" >> "$MK"
+            echo "[+] 已给 $MK 加 -I\$(src)"
+          fi
+          grep -n "ccflags" "$MK" || true
+
+      - name: "[修复4] 移除 GCC 4.9 不认识的编译选项"
+        run: |
+          set -e
+          # -Wno-enum-conversion 是 GCC 8+ 选项，4.9 不识别且被 -Werror 放大
+          n=$(grep -rl "Wno-enum-conversion" techpack kernel drivers 2>/dev/null | wc -l)
+          echo "命中文件数: $n"
+          [ "$n" -gt 0 ] && grep -rl "Wno-enum-conversion" techpack kernel drivers 2>/dev/null \
             | xargs -r sed -i 's/-Wno-enum-conversion//g' || true
           echo "[OK] 已清除"
 
@@ -120,7 +132,7 @@ jobs:
         run: |
           set -e
           cp arch/arm64/configs/sdm670_r17_ksu_defconfig .config
-          grep -E "CONFIG_KSU=|CONFIG_OPPO_ROOT_CHECK|CONFIG_BTFM_SLIM=|TFA98XX" .config || true
+          grep -E "CONFIG_KSU=|CONFIG_BTFM_SLIM=|TFA98XX" .config || true
 
       - name: 解析依赖
         run: |
@@ -166,16 +178,16 @@ jobs:
           export ARCH=arm64 SUBARCH=arm64
           export CROSS_COMPILE=$GITHUB_WORKSPACE/tc/bin/aarch64-linux-android-
           export USE_CCACHE=1 CCACHE_DIR=$GITHUB_WORKSPACE/.ccache
+          # -k : 遇错继续，一次跑完收集全部错误，避免来回试
           ret=0
-          make -j$(nproc) > build.log 2>&1 || ret=$?
-          echo "===== 最后 100 行 ====="
-          tail -100 build.log
+          make -k -j$(nproc) > build.log 2>&1 || ret=$?
+          echo "===== 最后 60 行 ====="
+          tail -60 build.log
+          echo "===== 全部错误/警告汇总 ====="
+          grep -nE "fatal error:|error:|Error [0-9]+|undeclared|implicit declaration" build.log \
+            | sort -u | head -50
           echo "===== make exit=$ret ====="
-          if [ $ret -ne 0 ]; then
-            echo "== 错误上下文 =="
-            grep -nE "error:|Error [0-9]|No such file" build.log | head -40
-            exit $ret
-          fi
+          exit $ret
 
       - name: 收集产物
         run: |
@@ -186,15 +198,12 @@ jobs:
                    arch/arm64/boot/Image.gz \
                    arch/arm64/boot/Image-dtb \
                    arch/arm64/boot/Image ; do
-            if [ -f "$f" ]; then cp "$f" out/; echo "[+] 已收集 $f"; ok=1; fi
+            if [ -f "$f" ]; then cp "$f" out/; echo "[+] $f"; ok=1; fi
           done
           cp .config out/config.txt
           [ -f build.log ] && cp build.log out/build.log || true
           ls -la out/
-          if [ "$ok" -ne 1 ]; then
-            echo "::error::未生成内核镜像，编译未成功"
-            exit 1
-          fi
+          [ "$ok" -eq 1 ] || { echo "::error::未生成内核镜像"; exit 1; }
 
       - name: 上传
         uses: actions/upload-artifact@v4
