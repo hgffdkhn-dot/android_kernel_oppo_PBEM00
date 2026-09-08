@@ -68,11 +68,49 @@ jobs:
             exit 1
           }
 
+      - name: 补齐 ten 分支缺失的头文件
+        run: |
+          set -e
+          if [ -f drivers/bluetooth/btfm_slim.h ]; then
+            echo "[=] btfm_slim.h 已存在，跳过"
+          else
+            echo "[!] 缺失 btfm_slim.h（R17 蓝牙走 SLIMbus，必需）"
+            git remote add reno https://github.com/OP46B1-Dev/android_kernel_oppo_sdm710.git 2>/dev/null || true
+            git fetch --depth 1 reno lineage-18.1
+            if git checkout reno/lineage-18.1 -- drivers/bluetooth/btfm_slim.h; then
+              echo "[OK] 已从 Reno 树补齐 btfm_slim.h"
+            else
+              echo "[!] 补齐失败 -> 关闭 BTFM_SLIM（蓝牙将不可用）"
+              scripts/config --file arch/arm64/configs/sdm670_r17_ksu_defconfig --disable CONFIG_BTFM_SLIM
+              scripts/config --file arch/arm64/configs/sdm670_r17_ksu_defconfig --disable CONFIG_BTFM_SLIM_WCN3990
+            fi
+          fi
+
+      - name: 移除 R17 不存在的 NXP 功放 (tfa98xx)
+        run: |
+          set -e
+          # R17 出厂配置无 NXP 功放，但 techpack Makefile 硬编码编它，
+          # 且它带 GCC4.9 不认识的 -Wno-enum-conversion，被 -Werror 放大成错。
+          echo "--- 处理前的引用:"
+          grep -rn "tfa98xx" techpack/audio --include=Makefile* || true
+          find techpack -name 'Makefile*' -exec sed -i '/[tT][fF][aA]98/d' {} + || true
+          echo "--- 处理后:"
+          grep -rn "tfa98xx" techpack/audio --include=Makefile* || echo "(已清空)"
+
+      - name: 移除 GCC 4.9 不支持的编译选项
+        run: |
+          set -e
+          before=$(grep -rl "Wno-enum-conversion" techpack kernel drivers 2>/dev/null | wc -l)
+          echo "命中文件数: $before"
+          grep -rl "Wno-enum-conversion" techpack kernel drivers 2>/dev/null \
+            | xargs -r sed -i 's/-Wno-enum-conversion//g' || true
+          echo "[OK] 已清除"
+
       - name: 应用 defconfig
         run: |
           set -e
           cp arch/arm64/configs/sdm670_r17_ksu_defconfig .config
-          grep -E "CONFIG_KSU=|CONFIG_OPPO_ROOT_CHECK" .config || true
+          grep -E "CONFIG_KSU=|CONFIG_OPPO_ROOT_CHECK|CONFIG_BTFM_SLIM=|TFA98XX" .config || true
 
       - name: 解析依赖
         run: |
