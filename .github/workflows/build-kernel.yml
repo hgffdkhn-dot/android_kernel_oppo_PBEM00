@@ -49,7 +49,7 @@ jobs:
           make olddefconfig
 
       # ================= 仅 ksunext 模式 =================
-      - name: [KSU] 拉取 Reno 4.9 backport
+      - name: "[KSU] 拉取 Reno 4.9 backport"
         if: inputs.mode == 'ksunext'
         run: |
           git config user.email ci@example.com
@@ -69,13 +69,13 @@ jobs:
           done
           git status --short | head -30
 
-      - name: [KSU] 安装 KernelSU-Next
+      - name: "[KSU] 安装 KernelSU-Next"
         if: inputs.mode == 'ksunext'
         run: |
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/legacy/kernel/setup.sh" | bash -s legacy
           ls drivers/kernelsu 2>/dev/null | head || echo "[!] 缺失"
 
-      - name: [KSU] 注入 hook
+      - name: "[KSU] 注入 hook"
         if: inputs.mode == 'ksunext'
         run: python3 ksu-build/inject_hooks.py .
 
@@ -102,4 +102,3 @@ jobs:
           name: r17-${{ inputs.mode }}
           path: out/
           retention-days: 30
-
