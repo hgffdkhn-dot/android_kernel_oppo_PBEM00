@@ -29,21 +29,54 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
             bc bison flex libssl-dev libelf-dev ccache \
-            python3 make gcc device-tree-compiler zip curl
+            make gcc device-tree-compiler zip curl \
+            python3 python-is-python3
+          # 工具链里的 gcc 是 #!/usr/bin/python 包装脚本，
+          # Ubuntu 22.04 默认没有 /usr/bin/python，必须装 python-is-python3
 
       - name: 下载 GCC 4.9 工具链
         run: |
-          git clone --depth 1 \
-            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 \
-            $GITHUB_WORKSPACE/tc
+          set -e
+          rm -rf "$GITHUB_WORKSPACE/tc"
+          mkdir -p "$GITHUB_WORKSPACE/tc"
+          echo "尝试主源: LineageOS 镜像"
+          if git clone --depth 1 -b lineage-19.1 \
+              https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git \
+              "$GITHUB_WORKSPACE/tc" ; then
+            echo "[OK] 主源下载成功"
+          else
+            echo "[!] 主源失败，回退 AOSP"
+            rm -rf "$GITHUB_WORKSPACE/tc"
+            mkdir -p "$GITHUB_WORKSPACE/tc"
+            git clone --depth 1 \
+              https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 \
+              "$GITHUB_WORKSPACE/tc"
+          fi
+
+      - name: 校验工具链（缺失立刻失败，不再假绿）
+        run: |
+          set -e
+          export CROSS_COMPILE=$GITHUB_WORKSPACE/tc/bin/aarch64-linux-android-
+          ls -la "$GITHUB_WORKSPACE/tc/bin/" | head -20
+          if [ ! -f "${CROSS_COMPILE}gcc" ]; then
+            echo "::error::工具链缺失: ${CROSS_COMPILE}gcc"
+            exit 1
+          fi
+          chmod +x "$GITHUB_WORKSPACE/tc/bin/"*
+          "${CROSS_COMPILE}gcc" --version || {
+            echo "::error::gcc 无法执行（可能缺少 /usr/bin/python）"
+            exit 1
+          }
 
       - name: 应用 defconfig
         run: |
+          set -e
           cp arch/arm64/configs/sdm670_r17_ksu_defconfig .config
-          grep -E "CONFIG_KSU=|# CONFIG_OPPO_ROOT_CHECK" .config
+          grep -E "CONFIG_KSU=|CONFIG_OPPO_ROOT_CHECK" .config || true
 
       - name: 解析依赖
         run: |
+          set -e
           export ARCH=arm64 SUBARCH=arm64
           export CROSS_COMPILE=$GITHUB_WORKSPACE/tc/bin/aarch64-linux-android-
           make olddefconfig
@@ -65,36 +98,55 @@ jobs:
             38baa0988a7aeef2efbfb4ccf6b06dd8d50e0538 \
             ba688d384ae45185e509d4152c5c86b82b1011bb ; do
             echo "--- cherry-pick $sha"
-            git cherry-pick --no-commit "$sha" 2>&1 | tail -3 || echo "[!] 冲突 $sha"
+            git cherry-pick --no-commit "$sha" || echo "[!] 冲突 $sha"
           done
-          git status --short | head -30
+          git status --short
 
       - name: "[KSU] 安装 KernelSU-Next"
         if: inputs.mode == 'ksunext'
         run: |
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/legacy/kernel/setup.sh" | bash -s legacy
-          ls drivers/kernelsu 2>/dev/null | head || echo "[!] 缺失"
+          ls drivers/kernelsu || echo "[!] 缺失"
 
       - name: "[KSU] 注入 hook"
         if: inputs.mode == 'ksunext'
         run: python3 ksu-build/inject_hooks.py .
 
       # ================= 编译 =================
-      - name: 编译
+      - name: 编译内核
         run: |
           export ARCH=arm64 SUBARCH=arm64
           export CROSS_COMPILE=$GITHUB_WORKSPACE/tc/bin/aarch64-linux-android-
           export USE_CCACHE=1 CCACHE_DIR=$GITHUB_WORKSPACE/.ccache
-          make -j$(nproc) 2>&1 | tail -80
+          ret=0
+          make -j$(nproc) > build.log 2>&1 || ret=$?
+          echo "===== 最后 100 行 ====="
+          tail -100 build.log
+          echo "===== make exit=$ret ====="
+          if [ $ret -ne 0 ]; then
+            echo "== 错误上下文 =="
+            grep -nE "error:|Error [0-9]|No such file" build.log | head -40
+            exit $ret
+          fi
 
       - name: 收集产物
         run: |
+          set -e
           mkdir -p out
-          for f in arch/arm64/boot/Image.gz-dtb arch/arm64/boot/Image.gz arch/arm64/boot/Image; do
-            [ -f "$f" ] && cp "$f" out/
+          ok=0
+          for f in arch/arm64/boot/Image.gz-dtb \
+                   arch/arm64/boot/Image.gz \
+                   arch/arm64/boot/Image-dtb \
+                   arch/arm64/boot/Image ; do
+            if [ -f "$f" ]; then cp "$f" out/; echo "[+] 已收集 $f"; ok=1; fi
           done
           cp .config out/config.txt
+          [ -f build.log ] && cp build.log out/build.log || true
           ls -la out/
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::未生成内核镜像，编译未成功"
+            exit 1
+          fi
 
       - name: 上传
         uses: actions/upload-artifact@v4
