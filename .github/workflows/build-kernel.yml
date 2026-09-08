@@ -68,23 +68,33 @@ jobs:
             exit 1
           }
 
-      - name: 补齐 ten 分支缺失的头文件
+      - name: 修复蓝牙 btfm_slim 编译
         run: |
           set -e
-          if [ -f drivers/bluetooth/btfm_slim.h ]; then
-            echo "[=] btfm_slim.h 已存在，跳过"
-          else
-            echo "[!] 缺失 btfm_slim.h（R17 蓝牙走 SLIMbus，必需）"
-            git remote add reno https://github.com/OP46B1-Dev/android_kernel_oppo_sdm710.git 2>/dev/null || true
-            git fetch --depth 1 reno lineage-18.1
-            if git checkout reno/lineage-18.1 -- drivers/bluetooth/btfm_slim.h; then
-              echo "[OK] 已从 Reno 树补齐 btfm_slim.h"
+          echo "=== 根因：btfm_slim.c 用 #include <btfm_slim.h>（尖括号），"
+          echo "    但 drivers/bluetooth/Makefile 没有 -I 指向自身目录，gcc 找不到。"
+          echo "    头文件其实一直在仓库里，缺的是 include 搜索路径。"
+
+          # 1) 确保头文件在位（从本仓库 ksu-build/ 兜底，不依赖外网）
+          for h in btfm_slim.h btfm_slim_wcn3990.h; do
+            if [ -f "drivers/bluetooth/$h" ]; then
+              echo "[=] $h 已存在"
             else
-              echo "[!] 补齐失败 -> 关闭 BTFM_SLIM（蓝牙将不可用）"
-              scripts/config --file arch/arm64/configs/sdm670_r17_ksu_defconfig --disable CONFIG_BTFM_SLIM
-              scripts/config --file arch/arm64/configs/sdm670_r17_ksu_defconfig --disable CONFIG_BTFM_SLIM_WCN3990
+              cp "ksu-build/$h" "drivers/bluetooth/$h" && echo "[+] 已补齐 $h"
             fi
+          done
+
+          # 2) 给 Makefile 加 include 搜索路径（真正的关键修复）
+          MK=drivers/bluetooth/Makefile
+          if grep -q "^-I\$(src)" "$MK"; then
+            echo "[=] $MK 已有 -I\$(src)"
+          else
+            cp "$MK" "$MK.bak"
+            sed -i '/^ccflags-y/a ccflags-y += -I$(src)' "$MK"
+            echo "[+] 已插入 ccflags-y += -I\$(src)"
           fi
+          echo "--- 当前 ccflags 行:"
+          grep -n "ccflags" "$MK"
 
       - name: 移除 R17 不存在的 NXP 功放 (tfa98xx)
         run: |
